@@ -1,0 +1,159 @@
+// Edwin Jhoel Cobeñas Ramos
+// ESP32 TRANSMISOR SIMPLIFICADO - Sensores + LoRa RYLR998
+
+#include <Wire.h>
+#include <DHT.h>
+#include <BH1750.h>
+#include <HardwareSerial.h>
+
+// Configuración de pines
+#define DHTPIN 4
+#define DHTTYPE DHT22
+#define SOIL_PIN 34
+#define LORA_RX 16
+#define LORA_TX 17
+
+// Configuración LoRa
+const int LORA_ADDRESS = 1;
+const int DEST_ADDRESS = 2;
+const int NETWORK_ID = 18;
+
+// Intervalo de envío (15 segundos)
+const long SEND_INTERVAL = 15000; 
+
+// Objetos
+DHT dht(DHTPIN, DHTTYPE);
+BH1750 lightMeter;
+HardwareSerial LoRaSerial(2);
+
+// Variables de sensores
+float temperature = 0;
+float humidity = 0;
+float lux = 0;
+int soilMoisture = 0;
+
+// Calibración del sensor de suelo
+const int AIR_VALUE = 2000;
+const int WATER_VALUE = 1000;
+
+// Control de tiempo
+unsigned long lastSend = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32 Transmisor LoRa Iniciado");
+  
+  // Inicializar I2C con pines específicos
+  Wire.begin(21, 22); // SDA=21, SCL=22
+  
+  // Inicializar sensores
+  dht.begin();
+  
+  // Inicializar BH1750 con verificación
+  if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
+    Serial.println("BH1750 iniciado correctamente");
+  } else {
+    Serial.println("Error: No se pudo inicializar BH1750");
+  }
+  
+  // Configurar resolución ADC
+  analogReadResolution(12);
+  
+  // Inicializar LoRa
+  LoRaSerial.begin(115200, SERIAL_8N1, LORA_RX, LORA_TX);
+  delay(1000);
+  setupLoRa();
+  
+  Serial.println("Sistema listo - Enviando cada 15s");
+}
+
+void loop() {
+  if (millis() - lastSend >= SEND_INTERVAL) {
+    lastSend = millis();
+    
+    readSensors();
+    sendData();
+    
+    // Mostrar solo resumen
+    Serial.println("Datos enviados: T=" + String(temperature,1) + 
+                  "°C, H=" + String(humidity,1) + 
+                  "%, L=" + String(lux,0) + 
+                  "lux, S=" + String(soilMoisture) + "%");
+  }
+  
+  delay(100);
+}
+
+void setupLoRa() {
+  Serial.println("Configurando LoRa...");
+  
+  LoRaSerial.println("AT+RESET");
+  delay(2000);
+  
+  LoRaSerial.println("AT+ADDRESS=" + String(LORA_ADDRESS));
+  delay(500);
+  
+  LoRaSerial.println("AT+NETWORKID=" + String(NETWORK_ID));
+  delay(500);
+  
+  LoRaSerial.println("AT+PARAMETER=12,4,1,7");
+  delay(500);
+  
+  Serial.println("LoRa configurado");
+}
+
+void readSensors() {
+  // Leer DHT22
+  temperature = dht.readTemperature();
+  humidity = dht.readHumidity();
+  
+  // Validar lecturas DHT22
+  if (isnan(temperature) || temperature < -40 || temperature > 80) {
+    temperature = 0;
+  }
+  if (isnan(humidity) || humidity < 0 || humidity > 100) {
+    humidity = 0;
+  }
+  
+  // Leer BH1750 con verificación
+  if (lightMeter.measurementReady()) {
+    lux = lightMeter.readLightLevel();
+    if (lux < 0 || lux > 100000) { // Validar rango razonable
+      lux = 0;
+    }
+  } else {
+    // Si no está listo, intentar una lectura directa
+    lux = lightMeter.readLightLevel();
+    if (lux < 0) lux = 0;
+  }
+  
+  // Leer sensor de suelo
+  int soilRaw = analogRead(SOIL_PIN);
+  soilMoisture = map(soilRaw, AIR_VALUE, WATER_VALUE, 0, 100);
+  soilMoisture = constrain(soilMoisture, 0, 100);
+}
+
+void sendData() {
+  // Crear payload compacto
+  String payload = "T:" + String(temperature, 1) + 
+                  ",H:" + String(humidity, 1) + 
+                  ",L:" + String(lux, 0) + 
+                  ",S:" + String(soilMoisture);
+  
+  // Enviar por LoRa
+  String command = "AT+SEND=" + String(DEST_ADDRESS) + "," + 
+                  String(payload.length()) + "," + payload;
+  
+  LoRaSerial.println(command);
+  
+  // Verificar respuesta
+  delay(500);
+  if (LoRaSerial.available()) {
+    String response = LoRaSerial.readString();
+    if (response.indexOf("+OK") >= 0) {
+      Serial.println("✓ OK");
+    } else {
+      Serial.println("✗ Error");
+    }
+  }
+}

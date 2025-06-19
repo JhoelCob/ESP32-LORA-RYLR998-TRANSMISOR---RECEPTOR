@@ -1,0 +1,973 @@
+// Edwin Jhoel Cobeñas Ramos
+// ESP32 RECEPTOR LoRa + WiFi + Servidor Web de Telemetría
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <HardwareSerial.h>
+#include <ArduinoJson.h>
+#include <ESPmDNS.h>
+
+// Configuración LoRa
+#define LORA_RX 16
+#define LORA_TX 17
+const int LORA_ADDRESS = 2;
+const int NETWORK_ID = 18;
+
+// Objetos
+HardwareSerial LoRaSerial(2);
+WebServer server(80);
+Preferences preferences;
+
+// Variables de datos recibidos
+struct SensorData {
+  float temperature = 0;
+  float humidity = 0;
+  float lux = 0;
+  int soilMoisture = 0;
+  int soilRaw = 0;
+  unsigned long lastUpdate = 0;
+  bool dataValid = false;
+};
+
+SensorData sensorData;
+
+// Variables WiFi
+String ssid = "";
+String password = "";
+bool wifiConnected = false;
+
+// Historial de datos (últimas 50 lecturas)
+const int MAX_HISTORY = 50;
+struct DataPoint {
+  unsigned long timestamp;
+  float temperature;
+  float humidity;
+  float lux;
+  int soilMoisture;
+};
+DataPoint dataHistory[MAX_HISTORY];
+int historyIndex = 0;
+int historyCount = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("=== ESP32 RECEPTOR LORA + WIFI + WEB ===");
+  
+  // Inicializar preferencias
+  preferences.begin("wifi-config", false);
+  
+  // Inicializar LoRa
+  setupLoRa();
+  
+  // Intentar conectar WiFi
+  loadWiFiCredentials();
+  
+  if (ssid.length() > 0) {
+    Serial.println("Intentando conectar con credenciales guardadas...");
+    connectToWiFi(ssid, password);
+  }
+  
+  if (!wifiConnected) {
+    Serial.println("No se pudo conectar. Solicitando credenciales...");
+    requestWiFiCredentials();
+  }
+  
+  if (wifiConnected) {
+    setupWebServer();
+    setupMDNS();
+  }
+  
+  Serial.println("Sistema inicializado");
+  Serial.println("IP: " + WiFi.localIP().toString());
+  Serial.println("Acceso web: http://" + WiFi.localIP().toString());
+}
+
+void loop() {
+  // Manejar servidor web
+  if (wifiConnected) {
+    server.handleClient();
+  }
+  
+  // Leer datos LoRa
+  readLoRaData();
+  
+  // Verificar conexión WiFi
+  if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+    Serial.println("WiFi desconectado. Reintentando...");
+    wifiConnected = false;
+    WiFi.reconnect();
+    delay(5000);
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      Serial.println("WiFi reconectado");
+    }
+  }
+  
+  delay(100);
+}
+
+void setupLoRa() {
+  Serial.println("Configurando LoRa...");
+  
+  LoRaSerial.begin(115200, SERIAL_8N1, LORA_RX, LORA_TX);
+  delay(1000);
+  
+  LoRaSerial.println("AT+RESET");
+  delay(2000);
+  
+  LoRaSerial.println("AT+ADDRESS=" + String(LORA_ADDRESS));
+  delay(500);
+  
+  LoRaSerial.println("AT+NETWORKID=" + String(NETWORK_ID));
+  delay(500);
+  
+  LoRaSerial.println("AT+PARAMETER=12,4,1,7");
+  delay(500);
+  
+  Serial.println("LoRa configurado como receptor");
+}
+
+void loadWiFiCredentials() {
+  ssid = preferences.getString("ssid", "");
+  password = preferences.getString("password", "");
+  
+  if (ssid.length() > 0) {
+    Serial.println("Credenciales WiFi encontradas en memoria");
+  }
+}
+
+void saveWiFiCredentials(String newSSID, String newPassword) {
+  preferences.putString("ssid", newSSID);
+  preferences.putString("password", newPassword);
+  Serial.println("Credenciales WiFi guardadas en memoria flash");
+}
+
+void requestWiFiCredentials() {
+  Serial.println("\n=== CONFIGURACIÓN WIFI ===");
+  Serial.println("Ingrese las credenciales de red:");
+  
+  // Solicitar SSID
+  Serial.print("SSID: ");
+  while (!Serial.available()) {
+    delay(100);
+  }
+  ssid = Serial.readStringUntil('\n');
+  ssid.trim();
+  
+  // Solicitar contraseña
+  Serial.print("Contraseña: ");
+  while (!Serial.available()) {
+    delay(100);
+  }
+  password = Serial.readStringUntil('\n');
+  password.trim();
+  
+  Serial.println("Credenciales recibidas. Conectando...");
+  
+  // Intentar conectar
+  if (connectToWiFi(ssid, password)) {
+    saveWiFiCredentials(ssid, password);
+  } else {
+    Serial.println("Error de conexión. Reintentando configuración...");
+    requestWiFiCredentials();
+  }
+}
+
+bool connectToWiFi(String networkSSID, String networkPassword) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(networkSSID.c_str(), networkPassword.c_str());
+  
+  Serial.print("Conectando a " + networkSSID + "");
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✓ WiFi conectado exitosamente");
+    Serial.println("IP: " + WiFi.localIP().toString());
+    wifiConnected = true;
+    return true;
+  } else {
+    Serial.println("\n✗ Error de conexión WiFi");
+    return false;
+  }
+}
+
+void setupMDNS() {
+  if (MDNS.begin("esp32-telemetria")) {
+    Serial.println("mDNS iniciado: http://esp32-telemetria.local");
+  }
+}
+
+void setupWebServer() {
+  // Página principal
+  server.on("/", handleRoot);
+  
+  // API para datos en tiempo real
+  server.on("/api/data", handleAPIData);
+  
+  // API para historial
+  server.on("/api/history", handleAPIHistory);
+  
+  // Archivos estáticos
+  server.on("/style.css", handleCSS);
+  server.on("/script.js", handleJS);
+  
+  server.begin();
+  Serial.println("Servidor web iniciado en puerto 80");
+}
+
+void readLoRaData() {
+  if (LoRaSerial.available()) {
+    String received = LoRaSerial.readString();
+    received.trim();
+    
+    Serial.println("Datos LoRa recibidos: " + received); // Debug
+    
+    // Buscar datos válidos: +RCV=address,length,data,RSSI,SNR
+    if (received.indexOf("+RCV=") >= 0) {
+      // Formato: +RCV=1,23,T:24.9,H:69.6,L:37,S:12,-6,11
+      // Necesitamos extraer solo la parte de datos entre las primeras dos comas y antes del RSSI
+      
+      // Encontrar las posiciones de las comas
+      int firstComma = received.indexOf(",");
+      int secondComma = received.indexOf(",", firstComma + 1);
+      
+      if (firstComma != -1 && secondComma != -1) {
+        // Obtener la longitud de los datos
+        String lengthStr = received.substring(firstComma + 1, secondComma);
+        int dataLength = lengthStr.toInt();
+        
+        // Extraer el payload usando la longitud
+        int dataStart = secondComma + 1;
+        String payload = received.substring(dataStart, dataStart + dataLength);
+        
+        Serial.println("Longitud esperada: " + String(dataLength)); // Debug
+        Serial.println("Payload extraído: " + payload); // Debug
+        
+        parseAndStoreSensorData(payload);
+        
+        // Extraer RSSI y SNR (después del payload)
+        int rssiStart = dataStart + dataLength + 1;
+        int rssiEnd = received.indexOf(",", rssiStart);
+        int snrStart = rssiEnd + 1;
+        
+        String rssi = "";
+        String snr = "";
+        
+        if (rssiEnd != -1) {
+          rssi = received.substring(rssiStart, rssiEnd);
+          snr = received.substring(snrStart);
+        } else {
+          // Si no hay coma, el resto es RSSI
+          rssi = received.substring(rssiStart);
+        }
+        
+        Serial.println("✓ Datos recibidos - RSSI: " + rssi + " SNR: " + snr);
+      }
+    }
+  }
+}
+
+void parseAndStoreSensorData(String payload) {
+  Serial.println("Parseando payload: " + payload); // Debug
+  
+  // Parsear formato: T:temp,H:hum,L:lux,S:soil
+  // Método más robusto usando split por comas
+  
+  // Inicializar valores por defecto
+  float newTemp = 0;
+  float newHum = 0;
+  float newLux = 0;
+  int newSoil = 0;
+  int newRaw = 0;
+  
+  // Dividir el payload por comas
+  int startIndex = 0;
+  int endIndex = 0;
+  int paramCount = 0;
+  
+  while (endIndex != -1 && paramCount < 5) {
+    endIndex = payload.indexOf(',', startIndex);
+    String param;
+    
+    if (endIndex == -1) {
+      param = payload.substring(startIndex);
+    } else {
+      param = payload.substring(startIndex, endIndex);
+    }
+    
+    param.trim();
+    Serial.println("Parámetro " + String(paramCount) + ": " + param); // Debug
+    
+    // Procesar cada parámetro
+    if (param.startsWith("T:")) {
+      String value = param.substring(2);
+      newTemp = value.toFloat();
+      Serial.println("Temperatura parseada: " + String(newTemp)); // Debug
+    }
+    else if (param.startsWith("H:")) {
+      String value = param.substring(2);
+      newHum = value.toFloat();
+      Serial.println("Humedad parseada: " + String(newHum)); // Debug
+    }
+    else if (param.startsWith("L:")) {
+      String value = param.substring(2);
+      newLux = value.toFloat();
+      Serial.println("Luz parseada: " + String(newLux)); // Debug
+    }
+    else if (param.startsWith("S:")) {
+      String value = param.substring(2);
+      newSoil = value.toInt();
+      Serial.println("Suelo parseado: " + String(newSoil)); // Debug
+    }
+    else if (param.startsWith("R:")) {
+      String value = param.substring(2);
+      newRaw = value.toInt();
+      Serial.println("Raw parseado: " + String(newRaw)); // Debug
+    }
+    
+    startIndex = endIndex + 1;
+    paramCount++;
+  }
+  
+  // Actualizar estructura de datos solo si los valores son válidos
+  if (newTemp != 0 || newHum != 0 || newLux != 0 || newSoil != 0) {
+    sensorData.temperature = newTemp;
+    sensorData.humidity = newHum;
+    sensorData.lux = newLux;
+    sensorData.soilMoisture = newSoil;
+    sensorData.soilRaw = newRaw;
+    sensorData.lastUpdate = millis();
+    sensorData.dataValid = true;
+    
+    // Agregar al historial
+    addToHistory();
+    
+    // Mostrar datos en serial
+    printReceivedData();
+  } else {
+    Serial.println("ERROR: No se pudieron parsear los datos correctamente");
+  }
+}
+
+void addToHistory() {
+  dataHistory[historyIndex].timestamp = millis();
+  dataHistory[historyIndex].temperature = sensorData.temperature;
+  dataHistory[historyIndex].humidity = sensorData.humidity;
+  dataHistory[historyIndex].lux = sensorData.lux;
+  dataHistory[historyIndex].soilMoisture = sensorData.soilMoisture;
+  
+  historyIndex = (historyIndex + 1) % MAX_HISTORY;
+  if (historyCount < MAX_HISTORY) historyCount++;
+}
+
+void printReceivedData() {
+  Serial.println("--- DATOS RECIBIDOS ---");
+  Serial.println("Temperatura: " + String(sensorData.temperature, 1) + "°C");
+  Serial.println("Humedad: " + String(sensorData.humidity, 1) + "%");
+  Serial.println("Luz: " + String(sensorData.lux, 0) + " lux");
+  Serial.println("Humedad Suelo: " + String(sensorData.soilMoisture) + "%");
+  Serial.println("Suelo Raw: " + String(sensorData.soilRaw));
+  Serial.println("----------------------");
+}
+
+void handleRoot() {
+  String html = R"(
+<!DOCTYPE html>
+<html lang='es'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>Sistema de Telemetría IoT</title>
+    <link rel='stylesheet' href='/style.css'>
+    <script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
+</head>
+<body>
+    <div class='container'>
+        <header>
+            <h1>🌱 Sistema de Telemetría Agrícola</h1>
+            <div class='status' id='status'>Conectando...</div>
+        </header>
+        
+        <div class='cards-grid'>
+            <div class='card temperature'>
+                <div class='card-icon'>🌡️</div>
+                <div class='card-content'>
+                    <h3>Temperatura</h3>
+                    <div class='value' id='temperature'>--°C</div>
+                </div>
+            </div>
+            
+            <div class='card humidity'>
+                <div class='card-icon'>💧</div>
+                <div class='card-content'>
+                    <h3>Humedad</h3>
+                    <div class='value' id='humidity'>--%</div>
+                </div>
+            </div>
+            
+            <div class='card light'>
+                <div class='card-icon'>☀️</div>
+                <div class='card-content'>
+                    <h3>Luz</h3>
+                    <div class='value' id='light'>-- lux</div>
+                </div>
+            </div>
+            
+            <div class='card soil'>
+                <div class='card-icon'>🌿</div>
+                <div class='card-content'>
+                    <h3>Humedad Suelo</h3>
+                    <div class='value' id='soil'>--%</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class='charts-container'>
+            <div class='chart-container'>
+                <h3>📊 Temperatura, Humedad y Humedad del Suelo</h3>
+                <div class='chart-wrapper'>
+                    <canvas id='mainChart'></canvas>
+                </div>
+            </div>
+            
+            <div class='chart-container'>
+                <h3>☀️ Nivel de Luz</h3>
+                <div class='chart-wrapper'>
+                    <canvas id='lightChart'></canvas>
+                </div>
+            </div>
+        </div>
+        
+        <div class='info'>
+            <p>Última actualización: <span id='lastUpdate'>--</span></p>
+        </div>
+    </div>
+    
+    <script src='/script.js'></script>
+</body>
+</html>
+)";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleCSS() {
+  String css = R"(
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Arial', sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+    padding: 15px;
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+header {
+    text-align: center;
+    margin-bottom: 25px;
+    color: white;
+}
+
+header h1 {
+    font-size: 2.2em;
+    margin-bottom: 10px;
+    text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+}
+
+.status {
+    display: inline-block;
+    padding: 8px 20px;
+    background: rgba(255,255,255,0.2);
+    border-radius: 20px;
+    font-weight: bold;
+    font-size: 0.9em;
+}
+
+.status.online {
+    background: rgba(76, 175, 80, 0.8);
+}
+
+.status.offline {
+    background: rgba(244, 67, 54, 0.8);
+}
+
+.cards-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 15px;
+    margin-bottom: 25px;
+}
+
+.card {
+    background: rgba(255, 255, 255, 0.95);
+    border-radius: 12px;
+    padding: 20px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.1);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.3);
+    transition: transform 0.3s ease;
+}
+
+.card:hover {
+    transform: translateY(-3px);
+}
+
+.card-icon {
+    font-size: 2.2em;
+    text-align: center;
+    margin-bottom: 10px;
+}
+
+.card-content h3 {
+    color: #333;
+    margin-bottom: 8px;
+    font-size: 1em;
+    text-align: center;
+}
+
+.value {
+    font-size: 1.8em;
+    font-weight: bold;
+    text-align: center;
+    color: #2c3e50;
+}
+
+.temperature .value { color: #e74c3c; }
+.humidity .value { color: #3498db; }
+.light .value { color: #f39c12; }
+.soil .value { color: #27ae60; }
+
+.charts-container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 20px;
+}
+
+.chart-container {
+    background: rgba(255, 255, 255, 0.95);
+    border-radius: 12px;
+    padding: 20px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.1);
+    min-height: 350px;
+}
+
+.chart-container h3 {
+    color: #333;
+    margin-bottom: 15px;
+    text-align: center;
+    font-size: 1.1em;
+}
+
+.chart-wrapper {
+    position: relative;
+    height: 280px;
+    width: 100%;
+}
+
+.chart-wrapper canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100% !important;
+    height: 100% !important;
+}
+
+.info {
+    text-align: center;
+    color: white;
+    font-size: 1em;
+    background: rgba(255,255,255,0.1);
+    padding: 12px;
+    border-radius: 8px;
+}
+
+/* Responsividad para pantallas medianas */
+@media (max-width: 1024px) {
+    .charts-container {
+        grid-template-columns: 1fr;
+        gap: 15px;
+    }
+    
+    .chart-container {
+        min-height: 320px;
+    }
+    
+    .chart-wrapper {
+        height: 250px;
+    }
+}
+
+/* Responsividad para tablets */
+@media (max-width: 768px) {
+    body {
+        padding: 10px;
+    }
+    
+    .cards-grid {
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+    }
+    
+    header h1 {
+        font-size: 1.8em;
+    }
+    
+    .value {
+        font-size: 1.5em;
+    }
+    
+    .card {
+        padding: 15px;
+    }
+    
+    .card-icon {
+        font-size: 1.8em;
+    }
+    
+    .chart-container {
+        padding: 15px;
+        min-height: 300px;
+    }
+    
+    .chart-wrapper {
+        height: 220px;
+    }
+}
+
+/* Responsividad para móviles */
+@media (max-width: 480px) {
+    body {
+        padding: 8px;
+    }
+    
+    .cards-grid {
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+    }
+    
+    header h1 {
+        font-size: 1.5em;
+        margin-bottom: 8px;
+    }
+    
+    .status {
+        padding: 6px 15px;
+        font-size: 0.8em;
+    }
+    
+    .card {
+        padding: 12px;
+    }
+    
+    .card-icon {
+        font-size: 1.5em;
+        margin-bottom: 8px;
+    }
+    
+    .card-content h3 {
+        font-size: 0.9em;
+        margin-bottom: 5px;
+    }
+    
+    .value {
+        font-size: 1.3em;
+    }
+    
+    .chart-container {
+        padding: 12px;
+        min-height: 280px;
+    }
+    
+    .chart-container h3 {
+        font-size: 1em;
+        margin-bottom: 10px;
+    }
+    
+    .chart-wrapper {
+        height: 200px;
+    }
+    
+    .info {
+        font-size: 0.9em;
+        padding: 10px;
+    }
+}
+
+/* Para pantallas muy pequeñas */
+@media (max-width: 360px) {
+    .cards-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .chart-wrapper {
+        height: 180px;
+    }
+    
+    .chart-container {
+        min-height: 250px;
+    }
+}
+)";
+  
+  server.send(200, "text/css", css);
+}
+
+void handleJS() {
+  String js = R"(
+let mainChart;
+let lightChart;
+let lastDataTime = 0;
+
+// Inicializar cuando la página carga
+document.addEventListener('DOMContentLoaded', function() {
+    initCharts();
+    updateData();
+    setInterval(updateData, 2000); // Actualizar cada 2 segundos
+});
+
+function initCharts() {
+    // Configuración común para ambos gráficos
+    const commonOptions = {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+            legend: {
+                position: 'top',
+                labels: {
+                    boxWidth: 12,
+                    font: {
+                        size: 11
+                    }
+                }
+            }
+        },
+        elements: {
+            point: {
+                radius: 2
+            }
+        },
+        scales: {
+            x: {
+                display: false
+            }
+        }
+    };
+
+    // Gráfico principal (Temperatura, Humedad, Humedad del Suelo)
+    const mainCtx = document.getElementById('mainChart').getContext('2d');
+    mainChart = new Chart(mainCtx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'Temperatura (°C)',
+                    data: [],
+                    borderColor: '#e74c3c',
+                    backgroundColor: 'rgba(231, 76, 60, 0.1)',
+                    tension: 0.4,
+                    fill: false,
+                    borderWidth: 2
+                },
+                {
+                    label: 'Humedad (%)',
+                    data: [],
+                    borderColor: '#3498db',
+                    backgroundColor: 'rgba(52, 152, 219, 0.1)',
+                    tension: 0.4,
+                    fill: false,
+                    borderWidth: 2
+                },
+                {
+                    label: 'Humedad Suelo (%)',
+                    data: [],
+                    borderColor: '#27ae60',
+                    backgroundColor: 'rgba(39, 174, 96, 0.1)',
+                    tension: 0.4,
+                    fill: false,
+                    borderWidth: 2
+                }
+            ]
+        },
+        options: {
+            ...commonOptions,
+            scales: {
+                ...commonOptions.scales,
+                y: {
+                    beginAtZero: true,
+                    max: 100,
+                    title: {
+                        display: true,
+                        text: '% / °C',
+                        font: {
+                            size: 10
+                        }
+                    },
+                    ticks: {
+                        font: {
+                            size: 10
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Gráfico de luz
+    const lightCtx = document.getElementById('lightChart').getContext('2d');
+    lightChart = new Chart(lightCtx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'Nivel de Luz (lux)',
+                    data: [],
+                    borderColor: '#f39c12',
+                    backgroundColor: 'rgba(243, 156, 18, 0.2)',
+                    tension: 0.4,
+                    fill: true,
+                    borderWidth: 2
+                }
+            ]
+        },
+        options: {
+            ...commonOptions,
+            scales: {
+                ...commonOptions.scales,
+                y: {
+                    beginAtZero: true,
+                    title: {
+                        display: true,
+                        text: 'Lux',
+                        font: {
+                            size: 10
+                        }
+                    },
+                    ticks: {
+                        font: {
+                            size: 10
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+async function updateData() {
+    try {
+        const response = await fetch('/api/data');
+        const data = await response.json();
+        
+        if (data.valid && data.lastUpdate > lastDataTime) {
+            // Actualizar tarjetas
+            document.getElementById('temperature').textContent = data.temperature.toFixed(1) + '°C';
+            document.getElementById('humidity').textContent = data.humidity.toFixed(1) + '%';
+            document.getElementById('light').textContent = Math.round(data.lux) + ' lux';
+            document.getElementById('soil').textContent = data.soilMoisture + '%';
+            
+            // Actualizar tiempo
+            const now = new Date();
+            document.getElementById('lastUpdate').textContent = now.toLocaleTimeString();
+            
+            // Estado online
+            document.getElementById('status').textContent = 'En línea';
+            document.getElementById('status').className = 'status online';
+            
+            lastDataTime = data.lastUpdate;
+            
+            // Actualizar gráficos
+            updateCharts();
+        }
+    } catch (error) {
+        console.error('Error al obtener datos:', error);
+        document.getElementById('status').textContent = 'Desconectado';
+        document.getElementById('status').className = 'status offline';
+    }
+}
+
+async function updateCharts() {
+    try {
+        const response = await fetch('/api/history');
+        const history = await response.json();
+        
+        if (history.length > 0) {
+            const labels = history.map((_, i) => i);
+            
+            // Actualizar gráfico principal
+            mainChart.data.labels = labels;
+            mainChart.data.datasets[0].data = history.map(d => d.temperature);
+            mainChart.data.datasets[1].data = history.map(d => d.humidity);
+            mainChart.data.datasets[2].data = history.map(d => d.soilMoisture);
+            mainChart.update('none');
+            
+            // Actualizar gráfico de luz
+            lightChart.data.labels = labels;
+            lightChart.data.datasets[0].data = history.map(d => d.lux);
+            lightChart.update('none');
+        }
+    } catch (error) {
+        console.error('Error al obtener historial:', error);
+    }
+}
+)";
+  
+  server.send(200, "text/javascript", js);
+}
+
+void handleAPIData() {
+  DynamicJsonDocument doc(1024);
+  
+  doc["temperature"] = sensorData.temperature;
+  doc["humidity"] = sensorData.humidity;
+  doc["lux"] = sensorData.lux;
+  doc["soilMoisture"] = sensorData.soilMoisture;
+  doc["soilRaw"] = sensorData.soilRaw;
+  doc["lastUpdate"] = sensorData.lastUpdate;
+  doc["valid"] = sensorData.dataValid;
+  doc["uptime"] = millis();
+  
+  String response;
+  serializeJson(doc, response);
+  
+  server.send(200, "application/json", response);
+}
+
+void handleAPIHistory() {
+  DynamicJsonDocument doc(4096);
+  JsonArray array = doc.to<JsonArray>();
+  
+  for (int i = 0; i < historyCount; i++) {
+    int index = (historyIndex - historyCount + i + MAX_HISTORY) % MAX_HISTORY;
+    
+    JsonObject point = array.createNestedObject();
+    point["timestamp"] = dataHistory[index].timestamp;
+    point["temperature"] = dataHistory[index].temperature;
+    point["humidity"] = dataHistory[index].humidity;
+    point["lux"] = dataHistory[index].lux;
+    point["soilMoisture"] = dataHistory[index].soilMoisture;
+  }
+  
+  String response;
+  serializeJson(doc, response);
+  
+  server.send(200, "application/json", response);
+}
