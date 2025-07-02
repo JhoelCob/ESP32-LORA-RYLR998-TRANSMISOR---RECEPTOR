@@ -1,9 +1,9 @@
 import statistics
 import csv
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt # pip install matplotlib
 
-tiempo = 0 # Columna de  la  fecha y hora
-var = 2 # Cambiar segun sea necesario
+tiempo = 0
+var =  # Modificar segun sea nesesario [1 - 3]
 
 def extraer_datos_sensor(sensores):
   datos_columna_1 = []
@@ -39,16 +39,16 @@ def graficar_datos(tiempos, valores, etiqueta_x, etiqueta_y):
   plt.figure(figsize=(12, 6))  # Define un buen tamaño para la figura
   plt.plot(tiempos, valores, marker='.', linestyle='-', color='c', label=etiqueta_y)
 
-  plt.title(f'Registro de {etiqueta_y} a lo largo de {etiqueta_x}', fontsize=16)
-  plt.xlabel(etiqueta_x, fontsize=12)
-  plt.ylabel(etiqueta_y, fontsize=12)
+  plt.title(f'Registro de {etiqueta_y} a lo largo de {etiqueta_x}', fontsize=10)
+  plt.xlabel(etiqueta_x, fontsize=7.5)
+  plt.ylabel(etiqueta_y, fontsize=7.5)
 
   # Mejora la legibilidad de las etiquetas del eje X
   plt.xticks(rotation=45, ha='right')
 
   # Evita la saturación del eje X mostrando un número limitado de etiquetas
-  if len(tiempos) > 20:
-    plt.gca().xaxis.set_major_locator(plt.MaxNLocator(20))
+  if len(tiempos) > 30:
+    plt.gca().xaxis.set_major_locator(plt.MaxNLocator(30))
 
   plt.grid(True, which='both', linestyle='--', linewidth=0.5)
   plt.tight_layout()  # Ajusta el gráfico para que todo encaje correctamente
@@ -69,4 +69,3 @@ if len(datos_col3) > 1:
   graficar_datos(datos_col1, datos_col3, nombre_col1, nombre_col3)
 else:
   print("No hay suficientes datos para calcular la desviación estándar o generar la gráfica.")
-
